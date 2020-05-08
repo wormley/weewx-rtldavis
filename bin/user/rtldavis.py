@@ -56,6 +56,10 @@ Run rtld on a thread and push the output onto a queue.
     debug_rain  = 0
     debug_rtld  = 2    # rtldavis logging: 1=inf; 2=(1)+data+chan; 3=(2)+pkt
 
+    # if extra data is older than this many seconds then we won't use it
+    extra_data_maxage = 120
+
+
     # The pct_good per transmitter can be saved to the database
     # This has only effect with 2 transmitters or more
     save_pct_good_per_transmitter = False
@@ -503,7 +507,8 @@ class Packet:
 
 class DATAPacket(Packet):
     IDENTIFIER = re.compile("^\d\d:\d\d:\d\d.[\d]{6} [0-9A-F][0-7][0-9A-F]{14}")
-    PATTERN = re.compile('([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2}) ([\d]+) ([\d]+) ([\d]+) ([\d]+)')
+# allow raw with or without repeater information
+    PATTERN = re.compile('([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2}|)([0-9A-F]{2}|) ([\d]+) ([\d]+) ([\d]+) ([\d]+)')
 
     @staticmethod
     def parse_text(self, payload, lines):
@@ -520,7 +525,7 @@ class DATAPacket(Packet):
             raw_pkt = bytearray([int(i, base=16) for i in raw_msg])
             pkt = self.parse_raw(self, raw_pkt)
             for i in range(0, 4):
-                pkt['curr_cnt%d' % i] = int(m.group(i + 9))
+                pkt['curr_cnt%d' % i] = int(m.group(i + 11))
             dbg_rtld(3, "data_pkt: %s" % pkt)
             lines.pop(0)
             return pkt
@@ -558,12 +563,39 @@ class CHANNELPacket(Packet):
             dbg_rtld(1, "CHANNELPacket: unrecognized data: '%s'" % lines[0])
             lines.pop(0)
 
+class EXTRAPacket(Packet):
+    IDENTIFIER = re.compile("extra:")
+    PATTERN = re.compile(r'[:,;]([^=]+)=([^,;\n]+)')
+
+    @staticmethod
+    def parse_text(self, payload, lines):
+        pkt = dict()
+        # don't need this to be an iterator, just need the matched groups
+        # do need to be able to see if any matches were found
+        matches = list(EXTRAPacket.PATTERN.finditer(lines[0]))
+        if matches:
+            # assume whatever sends this already knows the proper fields
+            pkt['selfMapped']=1
+            for m in matches:
+                try:
+                   d=float(m.group(2))
+                   pkt[m.group(1)]=d
+                except:
+                   pass
+            dbg_rtld(1,"extra:"+str(pkt))
+            lines.pop(0)
+            return pkt
+        else:
+            dbg_rtld(1, "EXTRAPacket: unrecognized data: '%s'" % lines[0])
+            lines.pop(0)
+
 
 class PacketFactory(object):
 
     # FIXME: do this with class introspection
     KNOWN_PACKETS = [
         DATAPacket,
+        EXTRAPacket,
         CHANNELPacket
     ]
 
@@ -807,9 +839,14 @@ class RtldavisDriver(weewx.drivers.AbstractDevice, weewx.engine.StdService):
     def _data_to_packet(self, data):
         packet = dict()
         # map sensor observations to database field names
-        for k in self.sensor_map:
-            if self.sensor_map[k] in data:
-                packet[k] = data[self.sensor_map[k]]
+        if ('selfMapped' in data):
+            for k in data.keys():
+                if (k != 'selfMapped'):
+                    packet[k]=data[k]
+        else:
+            for k in self.sensor_map:
+                if self.sensor_map[k] in data:
+                    packet[k] = data[self.sensor_map[k]]
         # convert the rain count to a rain delta measure
         if 'rain_count' in data:
             if self.last_rain_count is not None:
@@ -951,6 +988,7 @@ class RtldavisDriver(weewx.drivers.AbstractDevice, weewx.engine.StdService):
                         if data != self._last_pkt:
                             self._last_pkt = data
                             packet = self._data_to_packet(data)
+                        #    self.update_sidecar_data(packet)
                             if packet is not None:
                                 dbg_parse(3, "pkt= %s" % packet)
                                 yield packet
@@ -1338,8 +1376,8 @@ Actions:
                 if payload:
                     print(payload)
                 lines.pop(0)
-            for lines in mgr.get_stdout():
-                err = lines[0].strip()
+            for line in mgr.get_stdout():
+                err = line.strip()
                 if err:
                     print(err)
-                lines.pop(0)
+#                lines.pop(0)
